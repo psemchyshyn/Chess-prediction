@@ -1,0 +1,153 @@
+---
+title: "R Notebook"
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+---
+data = filter(data, (data$winner=="white" & data$white_rating > data$black_rating) | (data$winner=="black" & data$white_rating < data$black_rating))
+
+```{r}
+library(ggplot2)
+library(plyr)
+library(corrplot)
+library(stringr)
+
+
+data = read.csv("games.csv")
+data$bg_winner = (data$winner=="white" & data$white_rating > 1.2*data$black_rating) | (data$winner=="black" & 1.2*data$white_rating < data$black_rating)
+data$diff = abs(data$white_rating - data$black_rating)
+data$winner = data$winner %in% c("white", "draw")
+data$rt_bg = data$white_rating > 1.4*data$black_rating | 1.4*data$white_rating <data$black_rating
+
+mean(data$rt_bg)
+
+
+data1 = data[c("turns", "bg_winner", "diff", "rt_bg")]
+cor = rquery.cormat(data1)
+cor
+ggplot(data, aes(x=turns, y=..density.., fill=rt_bg)) + geom_density(alpha=.5)
+#data$turns = as.integer(data$turns)
+#data$rate_diff = data$white_rating - data$black_rating
+#means = ddply(data, "opening_name", summarise, grp.mean = mean(turns))
+#means
+#ggplot(data, aes(x=rate_diff, fill=winner)) + geom_density(alpha=0.5)
+```
+# Intro
+
+As the topic of the research I, as a big fan, chose chess. The dataset I used in 
+the analysis was found in kaggle (https://www.kaggle.com/datasnaek/chess). It
+contains a set with over 20.000 chess games played in 2016-2018 at one of 
+the most popular online chess platforms Lichess(https://lichess.org/). Each game
+includes the id of the players, the winner, the type of victory (checkmate, 
+resigning, exceeded time limit or draw), number of turns, the ratings of the
+players, info about the opening and other cool stuff.
+
+```{r}
+library(ggplot2)
+library(plyr)
+library(corrplot)
+library(stringr)
+library(fitdistrplus)
+data = read.csv("games.csv")
+head(data)
+```
+
+# Aim
+Obviously, one the most outstanding thing we can do with this dataset is to
+predict the winner of the game. In order to do that, let's decide what info in 
+the dataframe can be used for such prediction. Let's have a look at the
+correlation matrix constructed of relevant columns of dataframe.
+
+```{r}
+# Clear the data, we are not interested in game played in draw
+data = data[which(data$winner != "draw"), ]
+data$time = as.integer(str_extract(data$increment_code, "\\d+")) # increment code
+# is a convention of the given time for each player to make moves, by extracting
+# the first part we get time for moves (second part is an additional time in 
+# seconds after each move is made)
+data$is_white_winner = data$winner == "white" # need boolean values for creating
+#corr matrix
+data$win_through_mate = data$victory_status == "mate"
+
+data$rated = data$rated == "TRUE"
+data = data[c("rated", "turns", "white_rating", "black_rating", "is_white_winner",
+              "time", "win_through_mate")]
+matrix = rquery.cormat(data)
+```
+
+Unfortunately, correlation matrix doesn't show any significant dependency between
+the winner and  some other features that could be used later in modeling
+logistic regression. Therefore, did we come to the dead end? Actually, there is 
+a thing we could try to do else. The ratings of white player and black separately
+doesn't actually help our prediction. However, the difference between the player's
+ratings seems like a logical thing to suggest, when trying to predict the winner
+of the outcome of the game. Let's replace rating of white and black players with
+their difference and see how the correlation matrix changes.
+
+```{r}
+data$rating_diff = data$white_rating - data$black_rating # note that we don't 
+# take absolute value of difference
+data = data[c("rated", "turns", "is_white_winner", "time", "win_through_mate",
+              "rating_diff")]
+matrix = rquery.cormat(data)
+```
+
+That's much better, the difference in ratings and the winner are indeed dependent
+Before jumping straight to modeling our logistic regression, let's analyze the
+distribution of the difference between ratings, as it's our key to determining the
+winner and it is actually interesting to see how players are being selected at 
+this online platform. My first suggestion is that the distribution is normal, as
+this selection should be carefully selected usually with same rating with 
+normal deviation (so it would be much more interest in game for both players)
+
+```{r}
+ggplot(data, aes(x=rating_diff)) +
+  geom_histogram(aes(y=..density..), color="black", fill="white", binwidth = 80) + 
+  geom_density(alpha=.5, fill="red") + 
+  stat_function(fun=dnorm, geom="area", args=list(mean=mean(data$rating_diff), sd=sd(data$rating_diff)), color="blue", alpha=.3) +
+  labs(x="Difference between white player and black player ratings", y="Density", 
+       title="Distribution of rating difference")
+```
+Having a look at the density of our distribution, we can conclude that it really 
+resembles normal one quite a lot, however it is much peakier than the normal.
+First of all, that should mean that the kurtosis of our distribution is much
+higher than in normal one (3), while skewness should be near 0 (because 
+it is almost perfectly symmetrical). Take a look at the summary, to see it.
+```{r}
+descdist(data$rating_diff)
+```
+Summary proves our assumptions made on the basis of graphic. Cullen and Frey 
+graph also suggests that our distribution is closer more to logistic 
+than to a normal one. Therefore, I just googled logistic distribution and indeed: "It 
+resembles the normal distribution in shape but has heavier tails (higher kurtosis)." 
+Considering all said above, our hypothesis is that the distribution of rating
+difference is logistic. Before making any hasty decision, let's conduct a more
+detailed visual analysis to see if we can relate our distribution to a logistic one.
+
+```{r}
+fit.logistic = fitdist(data$rating_diff, "logis")
+#fit.logistic
+#plot(fit.logistic)
+fit.norm = fitdist(data$rating_diff, "norm")
+fit.norm
+fit.norm$estimate
+```
+
+Okay, the empirical cdf looks like converging to the theoretical one, Q-Q plot
+compares quantiles of our distribution and the theoretical one - they follow almost
+a straight line, which means that there is almost no deviation of our distribution
+from the theoretical logistic one. Similarly with P-P plot. Considering all of this, 
+can we finally conclude that we are dealing with logistic distribution? Visualization techniques are always good, but, unfortunately, we can't say anything for sure without
+a formal statistical test. Let's carry out one! For testing the distribution family, 
+we use a Kolgomorov-Smirnov test. By LLN, the empirical cdf should converge to the
+theoratical one, as sample size increases. By Glivenko–Cantelli theorem, the maximum 
+difference between respective points of ecdf and cdf -> 0 with probability 1.
+$\sup_{t\in R}|\hat{F_{x, n}}(t) -  F_x(t)| -> 0$. Therefore, if this difference is
+small enough, we say that our distribution belongs to the family we assumed. That is
+the logic behind Kolgomorov Smirnov test.
+
+```{r}
+ks.test(data$rating_diff, "plogis", fit.logistic$estimate[1], fit.logistic$estimate[2])
+ks.test(data$rating_diff, "pnorm", fit.norm$estimate[1], fit.norm$estimate[2])
+```
